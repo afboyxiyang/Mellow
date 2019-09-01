@@ -10,27 +10,154 @@ const fs = require('fs')
 const net = require('net')
 const util = require('util')
 const Netmask = require('netmask').Netmask
-const open = require('open')
+const Store = require('electron-store')
 
-// require('electron-reload')(__dirname)
-
-let helperFiles = [
-  'geo.mmdb',
-  'geosite.dat',
-  'md5sum',
-  'route',
-  'core'
-]
+const schema = {
+  enableFakeDns: {
+    type: 'boolean',
+    default: false
+  },
+  loglevel: {
+    type: 'string',
+    default: 'info'
+  }
+}
+const store = new Store({name: 'preference', schema: schema})
 
 let helperResourcePath = path.join(process.resourcesPath, 'helper')
-let helperInstallPath = "/Library/Application Support/Mellow"
-let logPath = log.transports.file.findLogPath('Mellow')
 
-let routeCmd = path.join(helperInstallPath, 'route')
-let coreCmd = path.join(helperInstallPath, 'core')
-let md5Cmd = path.join(helperInstallPath, 'md5sum')
+var helperInstallPath
+var helperFiles
+switch (process.platform) {
+  case 'darwin':
+    helperInstallPath = "/Library/Application Support/Mellow"
+    helperFiles = [
+      'geo.mmdb',
+      'geosite.dat',
+      'core',
+      'md5sum',
+      'route'
+    ]
+    break
+  case 'linux':
+    helperInstallPath = '/usr/local/mellow'
+    helperFiles = [
+      'geo.mmdb',
+      'geosite.dat',
+      'core',
+      'md5sum',
+      'ip'
+    ]
+    break
+}
+
+let logPath = log.transports.file.findLogPath('Mellow')
+let configFolder = app.getPath('userData')
+let configFile = path.join(configFolder, 'cfg.json')
+let configTemplate = `{
+    "log": {
+        "loglevel": "warning"
+    },
+    "outbounds": [
+        {
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [
+                    {
+                        "users": [
+                            {
+                                "id": "d2953280-9eb3-451d-aef6-283cd79ba62c",
+                                "alterId": 4
+                            }
+                        ],
+                        "address": "yourserver.com",
+                        "port": 10086
+                    }
+                ]
+            },
+            "tag": "proxy"
+        },
+        {
+            "protocol": "freedom",
+            "settings": {
+              "domainStrategy": "UseIP"
+            },
+            "tag": "direct"
+        }
+    ],
+    "dns": {
+        "servers": [
+            {
+                "address": "8.8.8.8",
+                "port": 53
+            },
+            {
+                "address": "223.5.5.5",
+                "port": 53,
+                "domains": [
+                    "geosite:cn"
+                ]
+            }
+        ]
+    },
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "ip": [
+                    "8.8.8.8/32"
+                ],
+                "type": "field",
+                "outboundTag": "proxy"
+            },
+            {
+                "type": "field",
+                "domain": [
+                    "geosite:cn"
+                ],
+                "outboundTag": "direct"
+            },
+            {
+                "type": "field",
+                "ip": [
+                    "geoip:cn",
+                    "geoip:private"
+                ],
+                "outboundTag": "direct"
+            },
+            {
+                "ip": [
+                    "0.0.0.0/0",
+                    "::/0"
+                ],
+                "type": "field",
+                "outboundTag": "proxy"
+            }
+        ]
+    }
+}`
+
+var md5Cmd
+var routeCmd
+var coreCmd
+switch(process.platform) {
+  case 'linux':
+    md5Cmd = path.join(helperInstallPath, 'md5sum')
+    coreCmd = path.join(helperInstallPath, 'core')
+    routeCmd = path.join(helperInstallPath, 'ip')
+    break
+  case 'darwin':
+    md5Cmd = path.join(helperInstallPath, 'md5sum')
+    coreCmd = path.join(helperInstallPath, 'core')
+    routeCmd = path.join(helperInstallPath, 'route')
+    break
+  case 'win32':
+    coreCmd = path.join(helperResourcePath, 'core.exe')
+    break
+}
 
 let running = false
+let helperVerified = false
 let coreNeedResume = false
 let tray = null
 let contextMenu = null
@@ -41,7 +168,20 @@ let coreInterrupt = false
 let origGw = null
 let origGwScope = null
 let sendThrough = null
-let tunName = 'mellow-tap0'
+
+var tunName
+switch (process.platform) {
+  case 'darwin':
+    tunName = 'utun233'
+    break
+  case 'win32':
+    tunName = 'mellow-tap0'
+    break
+  case 'linux':
+    tunName = 'tun1'
+    break
+}
+
 let tunAddr = '10.255.0.2'
 let tunMask = '255.255.255.0'
 let tunGw = '10.255.0.1'
@@ -50,6 +190,7 @@ var tunAddrBlock = new Netmask(tunAddr, tunMask)
 var trayOnIcon
 var trayOffIcon
 switch (process.platform) {
+  case 'linux':
   case 'darwin':
     trayOnIcon = path.join(__dirname, 'assets/tray-on-icon.png')
     trayOffIcon = path.join(__dirname, 'assets/tray-off-icon.png')
@@ -64,6 +205,7 @@ switch (process.platform) {
   case 'darwin':
     app.dock.hide()
     break
+  case 'linux':
   case 'win32':
     break
 }
@@ -104,7 +246,7 @@ function checkHelper() {
       }
     } catch (err) {
       if (err.status == 1) {
-        dialog.showErrorBox('Error', 'Failed checksum helper files, it seems md5 or awk command is missing.')
+        dialog.showErrorBox('Error', 'Failed checksum helper files, it seems md5/md5sum or awk command is missing.')
       } else {
         log.info(err)
         return false
@@ -113,15 +255,13 @@ function checkHelper() {
   }
   return true
 }
-// Return true if the core start successfully, otherwise return false.
+
 async function startCore(callback) {
   coreInterrupt = false
 
-  configFile = path.join(app.getPath('userData'), 'cfg.json')
-
   try {
     if (!fs.existsSync(configFile)) {
-      dialog.showErrorBox('Error', util.format('Can not find V2Ray config file at %s, if the file does not exist, you must create one, and note the file location is fixed.', configFile))
+      dialog.showMessageBox({message: 'Config file not found.'})
       return
     }
   } catch(err) {
@@ -143,25 +283,22 @@ async function startCore(callback) {
   var params
   var cmd
   switch (process.platform) {
+    case 'linux':
     case 'darwin':
-      cmd = coreCmd
       params = [
+        '-tunName', tunName,
         '-tunAddr', tunAddr,
         '-tunMask', tunMask,
         '-tunGw', tunGw,
         '-sendThrough', sendThrough,
         '-vconfig', configFile,
         '-proxyType', 'v2ray',
-        '-sniffingType', 'x',
         '-relayICMP',
-        '-fakeDns',
-        '-loglevel', 'info',
-        '-stats',
-        '-fakeDnsCacheDir', app.getPath('userData')
+        '-loglevel', store.get('loglevel'),
+        '-stats'
       ]
       break
     case 'win32':
-      cmd = path.join(helperResourcePath, 'core.exe')
       // The flag order is important, some flags won't work in specific
       // flag order, and I don't known exactly why is it.
       params = [
@@ -173,16 +310,18 @@ async function startCore(callback) {
         '-rpcPort', coreRpcPort.toString(),
         '-sendThrough', sendThrough,
         '-proxyType', 'v2ray',
-        '-sniffingType', 'x',
-        '-fakeDns',
+        '-relayICMP',
         '-stats',
-        '-loglevel', 'info',
-        '-vconfig', configFile,
-        '-fakeDnsCacheDir', app.getPath('userData')
+        '-loglevel', store.get('loglevel'),
+        '-vconfig', configFile
       ]
       break
   }
-  core = spawn(cmd, params)
+  if (store.get('enableFakeDns')) {
+    params.push('-fakeDns')
+    params.push('-fakeDnsCacheDir', app.getPath('userData'))
+  }
+  core = spawn(coreCmd, params)
   core.stdout.on('data', (data) => {
     log.info(data.toString())
   })
@@ -190,16 +329,19 @@ async function startCore(callback) {
     log.info(data.toString())
   })
   core.on('close', (code, signal) => {
+    log.info('Core stopped, code', code, 'signal' , signal)
+
     if (coreNeedResume) {
       // Change status and wait for the resume event callback to be called so the core will be restarted.
+      log.info('Core will restart upon device resume.')
       coreNeedResume = false
       core = null
       tray.setImage(trayOffIcon)
       return
     }
 
-    log.info('Core stopped, code', code, 'signal' , signal)
     if (code && code != 0) {
+      log.info('Core fails to startup, interrupt the starting procedure.')
       coreInterrupt = true
       core = null
       tray.setImage(trayOffIcon)
@@ -228,6 +370,7 @@ async function configRoute() {
   }
 
   switch (process.platform) {
+    case 'linux':
     case 'darwin':
       if (tunGw === null || origGw === null || origGwScope === null) {
         return
@@ -287,11 +430,14 @@ async function configRoute() {
       case 'win32':
         await sudoExec(util.format('%s %s %s', path.join(helperResourcePath, 'config_route.bat'), tunGw, origGw))
         break
+      case 'linux':
+        execSync(util.format('%s %s %s %s %s %s', path.join(helperResourcePath, 'config_route'), routeCmd, tunGw, origGw, origGwScope, sendThrough))
+        break
     }
     log.info('Set ' + tunGw + ' as the default gateway.')
-  } catch (error) {
-    log.info(error.stdout.toString())
-    log.info(error.stderr.toString())
+  } catch (err) {
+    log.info(err)
+    log.info(err)
     dialog.showErrorBox('Error', util.format('Failed to configure routes, see "%s" for more details.', logPath))
   }
   tray.setImage(trayOnIcon)
@@ -309,6 +455,9 @@ async function recoverRoute() {
           break
         case 'win32':
           await sudoExec(util.format('%s %s', path.join(helperResourcePath, 'recover_route.bat'), origGw))
+          break
+        case 'linux':
+          execSync(util.format('%s %s %s', path.join(helperResourcePath, 'recover_route'), routeCmd, sendThrough, origGw))
           break
       }
     } catch (error) {
@@ -351,13 +500,19 @@ function stopCore() {
 const delay = ms => new Promise(res => setTimeout(res, ms))
 
 async function up() {
-  if (process.platform == "darwin") {
-    if (!checkHelper()) {
-      success = await installHelper()
-      if (!success) {
-        return
+  switch (process.platform) {
+    case 'darwin':
+    case 'linux':
+      if (!helperVerified) {
+        if (!checkHelper()) {
+          success = await installHelper()
+          if (!success) {
+            return
+          }
+        }
+        helperVerified = true
       }
-    }
+      break
   }
 
   gw = null
@@ -381,7 +536,7 @@ async function up() {
     // Routing seems ready, check if the core should restart.
     if (core === null) {
       startCore(null)
-      running = false
+      running = true
       return
     }
     return
@@ -415,8 +570,9 @@ async function up() {
     // if necessary.
     if (core === null) {
       startCore(configRoute)
-      running = false
-      return
+      running = true
+    } else {
+      configRoute()
     }
   }
 }
@@ -424,11 +580,14 @@ async function up() {
 async function down() {
   log.info('Shutting down the core.')
 
+  // Get the gateway first since stopping the core may causes
+  // the route to be deleted.
+  gw = getDefaultGateway()
+
   if (core) {
     stopCore()
   }
 
-  gw = getDefaultGateway()
   // Recover default route only if current route is to tunGw.
   if (gw !== null && tunAddrBlock.contains(gw['gateway'])) {
     recoverRoute()
@@ -504,9 +663,22 @@ async function sudoExec(cmd) {
 
 async function installHelper() {
   log.info('Installing helper.')
-  var installer = path.join(helperResourcePath, 'install_helper')
-  cmd = util.format('"%s" "%s" "%s"', installer, helperResourcePath, helperInstallPath)
+
+  var installer
+  var cmd
+
+  if (process.platform == 'linux') {
+    let tmpResDir = '/tmp/mellow_helper_res'
+    execSync(util.format('cp -r %s %s', helperResourcePath, tmpResDir))
+    installer = path.join(tmpResDir, 'install_helper')
+    cmd = util.format('"%s" "%s" "%s"', installer, tmpResDir, helperInstallPath)
+  } else {
+    installer = path.join(helperResourcePath, 'install_helper')
+    cmd = util.format('"%s" "%s" "%s"', installer, helperResourcePath, helperInstallPath)
+  }
+
   log.info('Executing:', cmd)
+
   try {
     await sudoExec(cmd)
     log.info('Helper installed.')
@@ -529,20 +701,96 @@ function createTray() {
       }
     },
     { type: 'separator' },
-    { label: 'Config', type: 'normal', click: function() {
-        shell.openItem(app.getPath('userData'))
-      }
+    { label: 'Config', type: 'submenu', submenu: Menu.buildFromTemplate([
+        { label: 'Edit', type: 'normal', click: function() {
+            try {
+              if (!fs.existsSync(configFile)) {
+                if (!fs.existsSync(configFolder)) {
+                  fs.mkdirSync(configFolder, { recursive: true })
+                }
+                fd = fs.openSync(configFile, 'w')
+                fs.writeSync(fd, configTemplate)
+                fs.closeSync(fd)
+              }
+            } catch (err) {
+              dialog.showErrorBox('Error', 'Failed to create file/folder: ' + err)
+            }
+            shell.openItem(configFile)
+          }
+        },
+        {
+          label: 'Open Folder',
+          type: 'normal',
+          click: () => { shell.openItem(configFolder) }
+        },
+      ])
     },
-    { label: 'Log', type: 'normal', click: function() {
-        shell.openItem(logPath)
-      }
+    { type: 'separator' },
+    {
+      label: 'Preferences',
+      type: 'submenu',
+      submenu: Menu.buildFromTemplate([
+        {
+          label: 'Fake DNS',
+          type: 'checkbox',
+          click: (item) => { store.set('enableFakeDns', item.checked) },
+          checked: store.get('enableFakeDns')
+        },
+        {
+          label: 'Log Level',
+          type: 'submenu',
+          submenu: Menu.buildFromTemplate([
+            {
+              label: 'debug',
+              type: 'radio',
+              click: () => { store.set('loglevel', 'debug') },
+              checked: store.get('loglevel') == 'debug'
+            },
+            {
+              label: 'info',
+              type: 'radio',
+              click: () => { store.set('loglevel', 'info') },
+              checked: store.get('loglevel') == 'info'
+            },
+            {
+              label: 'warn',
+              type: 'radio',
+              click: () => { store.set('loglevel', 'warn') },
+              checked: store.get('loglevel') == 'warn'
+            },
+            {
+              label: 'error',
+              type: 'radio',
+              click: () => { store.set('loglevel', 'error') },
+              checked: store.get('loglevel') == 'error'
+            },
+            {
+              label: 'none',
+              type: 'radio',
+              click: () => { store.set('loglevel', 'none') },
+              checked: store.get('loglevel') == 'none'
+            }
+          ])
+        }
+      ])
     },
+    { type: 'separator' },
     { label: 'Statistics', type: 'normal', click: function() {
         if (core === null) {
           dialog.showMessageBox({message: 'Proxy is not running.'})
         } else {
-          open('http://localhost:6001/stats/session/plain')
+          shell.openExternal('http://localhost:6001/stats/session/plain')
         }
+      }
+    },
+    {
+      label: 'Open Log',
+      type: 'normal',
+      click: () => { shell.openItem(logPath) }
+    },
+    { type: 'separator' },
+    { label: 'About', type: 'normal', click: function() {
+        dialog.showMessageBox({ message: util.format('Mellow (v%s)\n\n%s', app.getVersion(), 'https://github.com/eycorsican/Mellow') })
       }
     },
     { type: 'separator' },
@@ -552,6 +800,7 @@ function createTray() {
       }
     }
   ])
+
   tray.setToolTip('Mellow')
   tray.setContextMenu(contextMenu)
 }
